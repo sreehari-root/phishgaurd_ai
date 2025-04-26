@@ -1,20 +1,42 @@
+# src/gemini_handler.py (Tuned Version - Confirmed Correct)
+
 import os
 import google.generativeai as genai
 from dotenv import load_dotenv
 import json
 import time # For potential retries
 import urllib.parse # Added for URL parsing in analyze_url_simulated
+import streamlit as st # Added for Streamlit Secrets check
 
-# Load API Key from .env file
+# Load API Key from .env file (for local development)
 load_dotenv()
 API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# --- ADD Streamlit Secrets Check ---
+# Check Streamlit secrets if API_KEY wasn't found in .env
+# This is necessary for deployment on Streamlit Community Cloud
+if not API_KEY:
+    try:
+        # st.secrets is available only when deployed on Streamlit Cloud/sharing
+        if hasattr(st, 'secrets') and "GOOGLE_API_KEY" in st.secrets:
+            print("Reading API key from Streamlit Secrets.")
+            API_KEY = st.secrets["GOOGLE_API_KEY"]
+        else:
+             print("API Key not found in .env or Streamlit Secrets.")
+    except Exception as e:
+        # Handle potential errors if st.secrets isn't available
+        print(f"Could not check Streamlit secrets (might be running locally without Streamlit context): {e}")
+        pass # Continue without the key if secrets check fails
+# --- END Add ---
+
 
 # Global variable for model initialization status
 gemini_model_initialized = False
 model = None
 
+# --- Initialization Logic (uses the API_KEY variable which might now be from secrets) ---
 if not API_KEY:
-    print("Error: GOOGLE_API_KEY not found in .env file. AI features disabled.")
+    print("Error: GOOGLE_API_KEY not found in .env file or Streamlit Secrets. AI features disabled.")
 else:
     try:
         genai.configure(api_key=API_KEY)
@@ -55,6 +77,7 @@ def _call_gemini_with_retry(prompt, expect_json=True, max_retries=2, delay=5):
     while attempts <= max_retries:
         try:
             response = model.generate_content(prompt)
+            # Check for blocking or empty response
             if not response.parts:
                  feedback_reason = "Unknown"
                  if response.prompt_feedback and response.prompt_feedback.block_reason:
@@ -64,11 +87,15 @@ def _call_gemini_with_retry(prompt, expect_json=True, max_retries=2, delay=5):
             response_text = response.text.strip()
 
             if expect_json:
+                # Handle potential markdown code block fences
                 if response_text.startswith("```json"): response_text = response_text[7:]
                 if response_text.endswith("```"): response_text = response_text[:-3]
-                response_text = response_text.strip()
+                response_text = response_text.strip() # Clean whitespace again
+
+                # Validate if it's likely JSON before parsing
                 if not response_text.startswith('{') or not response_text.endswith('}'):
                      raise json.JSONDecodeError("Response does not look like JSON.", response_text, 0)
+
                 analysis_result = json.loads(response_text)
                 return analysis_result # Success (JSON)
             else:
@@ -76,16 +103,18 @@ def _call_gemini_with_retry(prompt, expect_json=True, max_retries=2, delay=5):
 
         except json.JSONDecodeError as e:
             print(f"Attempt {attempts+1}: Error decoding Gemini JSON response: {e}\nRaw response: {response.text if 'response' in locals() else 'N/A'}")
+            # Return error immediately for JSON decode issues
             return {"error": f"Failed to parse AI analysis response (JSON decode). Raw: {response.text if 'response' in locals() else 'N/A'}", "raw_response": response.text if 'response' in locals() else None}
-        except ValueError as ve:
+        except ValueError as ve: # Catch the specific blocked response error
              print(f"Attempt {attempts+1}: Gemini response blocked or invalid: {ve}")
+             # Return error immediately for blocked responses
              return {"error": f"Gemini response blocked or invalid: {ve}"} if expect_json else f"Error: Gemini response blocked or invalid: {ve}"
         except Exception as e:
             print(f"Attempt {attempts+1}: Error during Gemini API call: {e}")
             if attempts < max_retries:
                 print(f"Retrying in {delay} seconds...")
                 time.sleep(delay)
-            else:
+            else: # Max retries reached
                 error_details = f"Error: {e}"
                 if 'response' in locals() and hasattr(response, 'prompt_feedback') and response.prompt_feedback:
                      error_details += f" | Prompt Feedback: {response.prompt_feedback}"
@@ -94,7 +123,7 @@ def _call_gemini_with_retry(prompt, expect_json=True, max_retries=2, delay=5):
         attempts += 1
 
 
-def analyze_text_content(subject, body, sender, headers=None):
+def analyze_text_content(subject, body, sender, headers=None): # Ensure headers=None is present
     """
     Analyzes email/message content using Gemini for phishing/social engineering indicators.
     (Tuned Prompt for reducing false positives on legitimate emails)
@@ -102,7 +131,7 @@ def analyze_text_content(subject, body, sender, headers=None):
     if not gemini_model_initialized: return {"error": "Gemini model not initialized."}
     if not body and not headers: return {"error": "No body text or headers provided for analysis."}
 
-    # --- Header Formatting Logic (Same as before) ---
+    # --- Header Formatting Logic ---
     header_info_prompt = "[No header information provided or headers failed parsing]"
     if headers and isinstance(headers, dict) and "Error" not in headers:
          key_headers = {
@@ -110,7 +139,12 @@ def analyze_text_content(subject, body, sender, headers=None):
              'Return-Path': headers.get('Return-Path'), 'Reply-To': headers.get('Reply-To'),
              'Authentication-Results': headers.get('Authentication-Results'), 'Received_First': headers.get('Received_First'),
          }
-         filtered_headers = {k: v for k, v in key_headers.items() if v}
+         filtered_headers = {k: v for k, v in key_headers.items() if v} # Filter out None
+         # Limit length of headers to prevent overly long prompts
+         for k, v in filtered_headers.items():
+              if isinstance(v, str) and len(v) > 500: # Limit long headers like Auth-Results
+                   filtered_headers[k] = v[:500] + "..."
+
          header_info_prompt = f"""
          Consider the following header information for additional context:
          ```json
@@ -126,6 +160,10 @@ def analyze_text_content(subject, body, sender, headers=None):
     # --- End Header Formatting ---
 
     # --- Tuned Main Prompt ---
+    # Ensure body is also size-limited if necessary for very long emails
+    max_body_length = 4000 # Limit body length sent to API
+    truncated_body = body[:max_body_length] + ("..." if len(body) > max_body_length else "") if body else "[No body text provided or extracted]"
+
     prompt = f"""
     You are a cybersecurity analyst AI. Analyze the following email content and context for phishing, social engineering, and malware indicators. Be cautious but **differentiate between normal business communication (like standard deadlines, professional signatures, legitimate links from known domains like google.com) and genuinely malicious tactics.** Provide your analysis ONLY as a JSON object with the specified keys.
 
@@ -135,7 +173,7 @@ def analyze_text_content(subject, body, sender, headers=None):
     {header_info_prompt}
     Body:
     ---
-    {body if body else "[No body text provided or extracted]"}
+    {truncated_body}
     ---
 
     Required JSON Output Structure:
@@ -167,9 +205,9 @@ def analyze_url_simulated(url):
     if not gemini_model_initialized: return {"error": "Gemini model not initialized."}
     if not url: return {"error": "No URL provided for analysis."}
 
-    # --- Simulation Logic (Same as before) ---
+    # --- Simulation Logic ---
     simulated_content_description = f"The URL is: {url}."
-    known_good_domains = ["google.com", "microsoft.com", "apple.com", "amazon.com", "github.com", "linkedin.com", "facebook.com", "twitter.com", "youtube.com", "docs.google.com", "drive.google.com", "onedrive.live.com", "dropbox.com"] # Add more if needed
+    known_good_domains = ["google.com", "microsoft.com", "apple.com", "amazon.com", "github.com", "linkedin.com", "facebook.com", "twitter.com", "youtube.com", "docs.google.com", "drive.google.com", "onedrive.live.com", "dropbox.com", "projecthub.app"] # Added projecthub.app
     is_known_good = False
     try:
          parsed_uri = urllib.parse.urlparse(url)
@@ -180,14 +218,14 @@ def analyze_url_simulated(url):
               if domain == good_domain or domain.endswith('.' + good_domain):
                    is_known_good = True
                    simulated_content_description += f" Domain '{domain}' appears related to a known legitimate service ({good_domain})."
-                   break # Stop checking once known good found
+                   break
 
          if any(kw in domain or kw in path for kw in ["login", "verify", "signin", "recover", "account", "secure", "update", "webskr", "wp-admin", "admin"]):
              simulated_content_description += " URL path/domain suggests account actions or login page."
          if any(brand in domain for brand in ["paypa", "micros", "amazn", "googl", "appl", "bank", "office", "fedex", "dhl", "netflix", "wellsfargo", "chase"]) and not is_known_good:
              simulated_content_description += f" Domain '{domain}' might be attempting to impersonate a known brand."
-         tld = domain.split('.')[-1]
-         if tld in ['xyz', 'info', 'biz', 'top', 'live', 'icu', 'cyou', 'club', 'online', 'buzz', 'monster', 'pw', 'ga', 'ml', 'cf', 'gq']: # Added more free/abused TLDs
+         tld = domain.split('.')[-1] if '.' in domain else ''
+         if tld in ['xyz', 'info', 'biz', 'top', 'live', 'icu', 'cyou', 'club', 'online', 'buzz', 'monster', 'pw', 'ga', 'ml', 'cf', 'gq']:
              simulated_content_description += f" It uses a TLD ('.{tld}') sometimes associated with phishing or spam."
          if domain.count('.') > 2 and not any(known_good_ending in domain for known_good_ending in ['.co.uk', '.com.au', '.ac.uk', '.gov.uk', '.org.uk']):
               simulated_content_description += " It uses multiple subdomains."
@@ -219,7 +257,7 @@ def analyze_url_simulated(url):
     return _call_gemini_with_retry(prompt, expect_json=True)
 
 
-def generate_alert_explanation(score, factors, attachment_info=None):
+def generate_alert_explanation(score, factors, attachment_info=None): # Ensure attachment_info=None is present
     """
     Generates a concise, human-readable alert explanation using Gemini.
     (Tuned Prompt for better grounding and tone)
@@ -227,7 +265,7 @@ def generate_alert_explanation(score, factors, attachment_info=None):
     if not gemini_model_initialized:
         return "Alert explanation generation failed: Gemini model not initialized."
 
-    # --- Factors and Warning Formatting (Same as before) ---
+    # --- Factors and Warning Formatting ---
     factors_summary = "\n".join([f"- {key}: {value}" for key, value in factors.items() if value and value != 'N/A'])
 
     attachment_warning = ""
@@ -267,11 +305,15 @@ def generate_alert_explanation(score, factors, attachment_info=None):
     if isinstance(result, dict) and "error" in result:
         print(f"Error generating alert explanation (from retry func): {result['error']}")
         # Provide a more structured fallback based on score ranges
+        # Use RISK_THRESHOLDS defined in core_analyzer for consistency (need import or redefinition)
+        # Simplified logic here:
         if score >= 90: level, action = "Very High Risk", "Delete/Report Recommended."
         elif score >= 70: level, action = "High Risk", "Delete/Report Recommended."
         elif score >= 40: level, action = "Medium Risk", "Review Carefully/Verify."
         else: level, action = "Low Risk", "Likely Safe."
         attach_warn = " Check attachments carefully." if attachment_warning else ""
-        return f"**{level} Alert** (Score: {score}/100). Risk detected based on factors like: {list(factors.keys())}.{attach_warn} {action} (AI Explanation Failed)"
+        # Ensure factors.keys() is accessible or use a generic message
+        factor_keys_list = list(factors.keys()) if isinstance(factors, dict) else ["specified factors"]
+        return f"**{level} Alert** (Score: {score}/100). Risk detected based on factors like: {factor_keys_list}.{attach_warn} {action} (AI Explanation Failed)"
     else:
         return result # Return the generated text explanation
