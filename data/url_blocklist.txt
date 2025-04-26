@@ -1,0 +1,10 @@
+# Simple blocklist - add one domain or full URL per line
+# Comments start with #
+microsft-login.com
+paypal-secure-payments-info.net
+yourbank-support-update.org
+amazon-prime-rewards-claim.xyz
+paypa1.com/verify-login
+microsft-live.com/user/upgrade
+microsft-support-team.com
+# Add more known bad domains/URLs here
